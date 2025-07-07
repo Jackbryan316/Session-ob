@@ -14,11 +14,12 @@ TIMEFRAME = "H4"
 
 app = Flask(__name__)
 
+# Memory to prevent duplicate alerts
+last_alerts = {}
+
 def is_market_open():
     now = datetime.datetime.utcnow()
-    if now.weekday() >= 5:  # Saturday or Sunday
-        return False
-    return True
+    return now.weekday() < 5  # Monday to Friday
 
 def fetch_candles(pair):
     url = f"https://api-fxpractice.oanda.com/v3/instruments/{pair}/candles"
@@ -80,6 +81,7 @@ def send_discord_alert(pair, ob_type, entry, exit):
         print(f"❌ Failed to send alert: {response.status_code} - {response.text}")
 
 def scan_market():
+    global last_alerts
     while True:
         if not is_market_open():
             print("📴 Market is closed. No scan.")
@@ -92,7 +94,12 @@ def scan_market():
             candles = fetch_candles(pair)
             ob = detect_order_block(candles)
             if ob:
-                send_discord_alert(pair, ob["type"], ob["entry"], ob["exit"])
+                alert_id = f"{pair}-{ob['type']}-{ob['entry']}-{ob['exit']}"
+                if last_alerts.get(pair) != alert_id:
+                    send_discord_alert(pair, ob["type"], ob["entry"], ob["exit"])
+                    last_alerts[pair] = alert_id
+                else:
+                    print(f"🔁 Duplicate alert for {pair}. Skipping...")
             else:
                 print(f"No valid OB setup on {pair}")
 
