@@ -5,134 +5,107 @@ import datetime
 from flask import Flask, jsonify
 from threading import Thread
 
-# === CONFIGURATION ===
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 OANDA_API_KEY = os.getenv("OANDA_API_KEY")
-TIMEZONE_OFFSET = int(os.getenv("TIMEZONE_OFFSET", 1))  # Default is GMT+1
+TIMEZONE_OFFSET = int(os.getenv("TIMEZONE_OFFSET", 0))  # in hours
+
 PAIRS = ["XAU_USD", "GBP_USD", "EUR_USD", "USD_JPY", "GBP_JPY"]
 TIMEFRAME = "H4"
 
-# === LOGGING ===
-def log(message):
-    timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    with open("logs.txt", "a") as f:
-        f.write(f"[{timestamp}] {message}\n")
-    print(message)
+app = Flask(__name__)
 
-# === HELPER FUNCTIONS ===
 def is_market_open():
-    now_utc = datetime.datetime.utcnow()
-    local_time = now_utc + datetime.timedelta(hours=TIMEZONE_OFFSET)
-    if local_time.weekday() == 6:  # Sunday
-        if local_time.hour < 22:
-            return False
-    elif local_time.weekday() == 5:  # Saturday
+    now = datetime.datetime.utcnow()
+    if now.weekday() >= 5:  # Saturday or Sunday
         return False
     return True
 
-def fetch_candles(pair, count=5):
+def fetch_candles(pair):
     url = f"https://api-fxpractice.oanda.com/v3/instruments/{pair}/candles"
-    headers = {"Authorization": f"Bearer {OANDA_API_KEY}"}
     params = {
+        "count": 5,
         "granularity": TIMEFRAME,
-        "count": count,
         "price": "M"
     }
-    try:
-        response = requests.get(url, headers=headers, params=params)
-        data = response.json()
-        candles = data.get("candles", [])
-        return [
-            {
-                "open": float(c["mid"]["o"]),
-                "high": float(c["mid"]["h"]),
-                "low": float(c["mid"]["l"]),
-                "close": float(c["mid"]["c"]),
-                "time": c["time"]
-            }
-            for c in candles if c["complete"]
-        ]
-    except Exception as e:
-        log(f"❌ Error fetching candles for {pair}: {e}")
+    headers = {
+        "Authorization": f"Bearer {OANDA_API_KEY}"
+    }
+    response = requests.get(url, headers=headers, params=params)
+    if response.status_code != 200:
+        print(f"❌ Failed to fetch candles for {pair}: {response.status_code}")
         return []
+    return response.json().get("candles", [])
 
-def detect_bullish_engulfing(prev, current):
-    return prev["close"] < prev["open"] and current["close"] > current["open"] and current["close"] > prev["open"] and current["open"] < prev["close"]
+def detect_order_block(candles):
+    if len(candles) < 3:
+        return None
 
-def detect_bearish_engulfing(prev, current):
-    return prev["close"] > prev["open"] and current["close"] < current["open"] and current["close"] < prev["open"] and current["open"] > prev["close"]
+    c1 = candles[-3]
+    c2 = candles[-2]
+    c3 = candles[-1]
 
-def analyze_pair(pair):
-    log(f"🔍 Scanning {pair} for OB setup...")
-    candles = fetch_candles(pair)
-    if len(candles) < 2:
-        log(f"⚠️ Not enough data for {pair}")
-        return
+    def is_bullish(c): return float(c["mid"]["c"]) > float(c["mid"]["o"])
+    def is_bearish(c): return float(c["mid"]["c"]) < float(c["mid"]["o"])
 
-    prev, current = candles[-2], candles[-1]
-    entry_price = current["close"]
-    sl = current["low"] if current["close"] > current["open"] else current["high"]
-    tp = round(entry_price + (entry_price - sl) * 2, 3) if current["close"] > current["open"] else round(entry_price - (sl - entry_price) * 2, 3)
+    if is_bearish(c1) and is_bullish(c2) and is_bullish(c3):
+        return {
+            "type": "Bullish OB",
+            "entry": c2["mid"]["o"],
+            "exit": c3["mid"]["c"]
+        }
+    elif is_bullish(c1) and is_bearish(c2) and is_bearish(c3):
+        return {
+            "type": "Bearish OB",
+            "entry": c2["mid"]["o"],
+            "exit": c3["mid"]["c"]
+        }
+    return None
 
-    if detect_bullish_engulfing(prev, current):
-        message = (
-            f"📈 **Bullish OB detected** on {pair}\n"
-            f"🕒 Time: {current['time']}\n"
-            f"📥 Entry: {entry_price}\n"
-            f"⛔ SL: {sl}\n"
-            f"🎯 TP: {tp}\n"
-            f"[📷 View Chart](https://www.tradingview.com/chart/)\n"
-        )
-        send_discord_alert(message)
-    elif detect_bearish_engulfing(prev, current):
-        message = (
-            f"📉 **Bearish OB detected** on {pair}\n"
-            f"🕒 Time: {current['time']}\n"
-            f"📥 Entry: {entry_price}\n"
-            f"⛔ SL: {sl}\n"
-            f"🎯 TP: {tp}\n"
-            f"[📷 View Chart](https://www.tradingview.com/chart/)\n"
-        )
-        send_discord_alert(message)
+def send_discord_alert(pair, ob_type, entry, exit):
+    now = datetime.datetime.utcnow() + datetime.timedelta(hours=TIMEZONE_OFFSET)
+    chart_link = f"https://www.tradingview.com/chart/?symbol=OANDA:{pair}"
+    embed = {
+        "title": f"{ob_type} Detected on {pair}",
+        "description": f"📍 **Entry**: `{entry}`\n🎯 **Exit**: `{exit}`\n\n[📈 View on TradingView]({chart_link})",
+        "color": 65280 if "Bullish" in ob_type else 16711680,
+        "timestamp": now.isoformat()
+    }
+    data = {
+        "embeds": [embed]
+    }
+    response = requests.post(DISCORD_WEBHOOK_URL, json=data)
+    if response.status_code == 204:
+        print(f"✅ Alert sent for {pair}")
     else:
-        log(f"No setup on {pair}")
+        print(f"❌ Failed to send alert: {response.status_code} - {response.text}")
 
-def send_discord_alert(message):
-    try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": message})
-        log(f"✅ Signal sent")
-    except Exception as e:
-        log(f"❌ Error sending signal: {e}")
-
-# === MAIN SCANNER LOOP ===
-def run_bot():
+def scan_market():
     while True:
         if not is_market_open():
-            log("📴 Market is closed. No scan.")
+            print("📴 Market is closed. No scan.")
             time.sleep(300)
             continue
 
-        now = datetime.datetime.utcnow()
-        if now.minute % 15 != 0:
-            log("⏳ Waiting for 15-minute mark...")
-            time.sleep(60)
-            continue
-
+        print("🔄 Scanning for OB setups...")
         for pair in PAIRS:
-            analyze_pair(pair)
+            print(f"🔍 Checking {pair}...")
+            candles = fetch_candles(pair)
+            ob = detect_order_block(candles)
+            if ob:
+                send_discord_alert(pair, ob["type"], ob["entry"], ob["exit"])
+            else:
+                print(f"No valid OB setup on {pair}")
 
+        print("⏱️ Waiting 5 mins...")
         time.sleep(300)
-
-# === DASHBOARD ===
-app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return jsonify({"status": "Bot is running", "last_updated": datetime.datetime.utcnow().isoformat()})
+    return jsonify({"status": "Session OB Bot is running"})
 
-def start_dashboard():
+def run_flask():
     app.run(host="0.0.0.0", port=10000)
 
 if __name__ == '__main__':
-    Thread(target=start_dashboard).start()
-    run_bot()
+    Thread(target=run_flask).start()
+    scan_market()
