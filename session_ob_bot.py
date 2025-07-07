@@ -1,76 +1,80 @@
-import requests
-import datetime
-import pytz
 
-# Discord webhook
-WEBHOOK_URL = "https://discord.com/api/webhooks/1391664965026447401/eLaXj078VSscwc8FnR4rckBBfIzgwH7DPkAl_uy3yBDVabq-wGmqP_fUJ_EI2NCu2yez"
+import os import time import requests import datetime from flask import Flask, jsonify from threading import Thread
 
-# Logging file
-LOG_FILE = "session_ob_logs.txt"
+=============== CONFIG ===============
 
-# Mock OB scanner (replace with real OB detection logic later)
-def detect_order_block(pair, price):
-    # Simulate OB detection based on odd/even minute
-    now = datetime.datetime.utcnow()
-    if now.minute % 2 == 0:
-        return "Bullish"
-    elif now.minute % 3 == 0:
-        return "Bearish"
-    return None
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "") OANDA_API_KEY = os.getenv("OANDA_API_KEY", "") TIMEZONE_OFFSET = int(os.getenv("TIMEZONE_OFFSET", "1"))  # Nigeria is UTC+1 PAIR_LIST = ["XAU_USD", "GBP_USD", "EUR_USD", "USD_JPY", "GBP_JPY"] LOG_FILE = "logs.txt"
 
-# Market open check (Mon 10PM to Fri 10PM GMT)
-def is_market_open():
-    now = datetime.datetime.now(pytz.timezone("Africa/Lagos"))
-    weekday = now.weekday()
-    hour = now.hour
-    if weekday == 6 or (weekday == 0 and hour < 22):
-        return False
-    return True
+=============== FLASK DASHBOARD ===============
 
-# Send alert to Discord
-def send_discord_alert(pair, direction, entry, sl, tp):
-    timestamp = datetime.datetime.now(pytz.timezone("Africa/Lagos")).strftime("%Y-%m-%d %H:%M:%S")
-    content = (
-        f"📈 **{direction} Order Block Detected** on `{pair}`\n"
-        f"🕒 {timestamp}\n"
-        f"💰 Entry: `{entry}`\n"
-        f"🛑 SL: `{sl}` | 🎯 TP: `{tp}`"
-    )
-    requests.post(WEBHOOK_URL, json={"content": content})
+app = Flask(name) status = {"last_checked": None, "last_signal": None}
 
-    # Save to log file
-    with open(LOG_FILE, "a") as log:
-        log.write(f"{timestamp} - {pair} - {direction} OB\n")
-        log.write(f"Entry: {entry} | SL: {sl} | TP: {tp}\n\n")
+@app.route("/status") def get_status(): return jsonify(status)
 
-# Main bot logic
-def run_bot():
-    if not is_market_open():
-        print("📴 Market is closed. No scan.")
-        return
+def run_flask(): app.run(host="0.0.0.0", port=7860)
 
-    print("🔍 Scanning for OB setups...\n")
-    pairs = ["XAU_USD", "GBP_USD", "EUR_USD", "USD_JPY", "GBP_JPY"]
-    current_price = {
-        "XAU_USD": 2365.00,
-        "GBP_USD": 1.2820,
-        "EUR_USD": 1.0852,
-        "USD_JPY": 161.30,
-        "GBP_JPY": 206.15
-    }
+=============== LOGGING ===============
 
-    for pair in pairs:
-        print(f"🔍 Scanning {pair}...")
-        direction = detect_order_block(pair, current_price[pair])
-        if direction:
-            entry = current_price[pair]
-            sl = round(entry - 0.0010, 4) if direction == "Bullish" else round(entry + 0.0010, 4)
-            tp = round(entry + 0.0030, 4) if direction == "Bullish" else round(entry - 0.0030, 4)
+def log_event(message): timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") with open(LOG_FILE, "a") as f: f.write(f"[{timestamp}] {message}\n") print(message)
 
-            send_discord_alert(pair, direction, entry, sl, tp)
-            print(f"✅ Signal sent for {pair} ({direction})\n")
+=============== CANDLE FETCH ===============
+
+def fetch_candles(pair): url = f"https://api-fxpractice.oanda.com/v3/instruments/{pair}/candles" headers = {"Authorization": f"Bearer {OANDA_API_KEY}"} params = {"granularity": "H4", "count": 5} response = requests.get(url, headers=headers, params=params) if response.status_code == 200: candles = response.json()["candles"] return [candle for candle in candles if candle["complete"]] else: log_event(f"❌ Error fetching candles for {pair}: {response.text}") return []
+
+=============== ENGULFING OB DETECTION ===============
+
+def detect_ob(pair): candles = fetch_candles(pair) if len(candles) < 2: return None
+
+prev = candles[-2]["mid"]
+curr = candles[-1]["mid"]
+
+prev_body = float(prev["c"]) - float(prev["o"])
+curr_body = float(curr["c"]) - float(curr["o"])
+
+# Bearish Engulfing
+if prev_body > 0 and curr_body < 0 and float(curr["o"]) > float(prev["c"]) and float(curr["c"]) < float(prev["o"]):
+    return {"type": "bearish", "entry": curr["c"], "exit": float(curr["c"]) - 50}
+# Bullish Engulfing
+elif prev_body < 0 and curr_body > 0 and float(curr["o"]) < float(prev["c"]) and float(curr["c"]) > float(prev["o"]):
+    return {"type": "bullish", "entry": curr["c"], "exit": float(curr["c"]) + 50}
+return None
+
+=============== ALERT SENDER ===============
+
+def send_alert(pair, signal_type, entry, exit): chart_url = f"https://www.tradingview.com/chart/?symbol=OANDA:{pair.replace('_', '')}" content = f"📌 {signal_type.upper()} OB Signal on {pair}\n\nEntry: {entry}\nExit: {exit}\n\n📈 View Chart" data = {"content": content}
+
+try:
+    res = requests.post(DISCORD_WEBHOOK_URL, json=data)
+    if res.status_code == 204:
+        log_event(f"✅ Alert sent for {pair}")
+        status["last_signal"] = f"{pair} - {signal_type}"
+    else:
+        log_event(f"❌ Failed to send alert for {pair}: {res.text}")
+except Exception as e:
+    log_event(f"❌ Exception sending alert: {e}")
+
+=============== MAIN LOOP ===============
+
+def run_bot(): while True: now = datetime.datetime.utcnow() + datetime.timedelta(hours=TIMEZONE_OFFSET) weekday = now.weekday() hour = now.hour minute = now.minute
+
+if weekday == 6 or (weekday == 0 and hour < 22):
+        log_event("📴 Market is closed. No scan.")
+        time.sleep(300)
+        continue
+
+    log_event("🔍 Starting OB scan...")
+    for pair in PAIR_LIST:
+        log_event(f"🔎 Checking {pair}...")
+        result = detect_ob(pair)
+        if result:
+            send_alert(pair, result["type"], result["entry"], result["exit"])
         else:
-            print(f"❌ No OB setup on {pair}\n")
+            log_event(f"No OB setup on {pair}")
 
-# Run bot
-run_bot()
+    status["last_checked"] = now.strftime("%Y-%m-%d %H:%M:%S")
+    time.sleep(300)  # Wait 5 minutes
+
+=============== RUN EVERYTHING ===============
+
+Thread(target=run_flask).start() run_bot()
+
