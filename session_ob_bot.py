@@ -5,25 +5,28 @@ import datetime
 from flask import Flask, jsonify
 from threading import Thread
 
+# 🔐 Environment Variables
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 OANDA_API_KEY = os.getenv("OANDA_API_KEY")
 TIMEZONE_OFFSET = int(os.getenv("TIMEZONE_OFFSET", 0))  # in hours
 
+# 📊 Config
 PAIRS = ["XAU_USD", "GBP_USD", "EUR_USD", "USD_JPY", "GBP_JPY"]
-TIMEFRAME = "H4"  # ✅ This is now fixed back to 4-hour timeframe
+TIMEFRAME = "H4"
 
+# 🌐 Flask App
 app = Flask(__name__)
 
+# 🕒 Check if Market is Open (Mon–Fri)
 def is_market_open():
     now = datetime.datetime.utcnow()
-    if now.weekday() >= 5:  # Saturday or Sunday
-        return False
-    return True
+    return now.weekday() < 5  # 0–4 means Mon–Fri
 
+# 📈 Fetch Candles from OANDA
 def fetch_candles(pair):
     url = f"https://api-fxpractice.oanda.com/v3/instruments/{pair}/candles"
     params = {
-        "count": 10,
+        "count": 5,
         "granularity": TIMEFRAME,
         "price": "M"
     }
@@ -36,6 +39,7 @@ def fetch_candles(pair):
         return []
     return response.json().get("candles", [])
 
+# 🧠 Detect Smart Money OB using 3-candle pattern
 def detect_order_block(candles):
     if len(candles) < 3:
         return None
@@ -61,9 +65,11 @@ def detect_order_block(candles):
         }
     return None
 
+# 📤 Send Discord Alert with Correct TradingView Link
 def send_discord_alert(pair, ob_type, entry, exit):
     now = datetime.datetime.utcnow() + datetime.timedelta(hours=TIMEZONE_OFFSET)
-    chart_link = f"https://www.tradingview.com/chart/?symbol=OANDA:{pair}"
+    chart_pair = pair.replace("_", "")  # EUR_USD → EURUSD
+    chart_link = f"https://www.tradingview.com/chart/?symbol=FX:{chart_pair}"
     embed = {
         "title": f"{ob_type} Detected on {pair}",
         "description": f"📍 **Entry**: `{entry}`\n🎯 **Exit**: `{exit}`\n\n[📈 View on TradingView]({chart_link})",
@@ -79,6 +85,7 @@ def send_discord_alert(pair, ob_type, entry, exit):
     else:
         print(f"❌ Failed to send alert: {response.status_code} - {response.text}")
 
+# 🔄 Market Scanner
 def scan_market():
     while True:
         if not is_market_open():
@@ -99,16 +106,31 @@ def scan_market():
         print("⏱️ Waiting 5 mins...")
         time.sleep(300)
 
+# 🌍 Flask Endpoint
 @app.route('/')
 def home():
     return jsonify({"status": "Session OB Bot is running"})
 
+# 🚀 Run Flask + Bot in Parallel
 def run_flask():
     app.run(host="0.0.0.0", port=10000)
 
 if __name__ == '__main__':
     Thread(target=run_flask).start()
     scan_market()
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
