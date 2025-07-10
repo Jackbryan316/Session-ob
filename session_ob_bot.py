@@ -1,3 +1,5 @@
+# Updated Session OB Bot with Liquidity Sweep + Rejection Confirmation
+
 import os
 import time
 import requests
@@ -9,10 +11,12 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 OANDA_API_KEY = os.getenv("OANDA_API_KEY")
 TIMEZONE_OFFSET = int(os.getenv("TIMEZONE_OFFSET", 0))
 
-PAIRS = ["XAU_USD", "GBP_USD", "EUR_USD", "USD_JPY", "GBP_JPY"]
+PAIRS = ["XAU_USD", "GBP_USD", "EUR_USD"]
 TIMEFRAME = "H4"
 
 app = Flask(__name__)
+
+last_alerts = {}  # Store last signal per pair
 
 def is_market_open():
     now = datetime.datetime.utcnow()
@@ -20,77 +24,86 @@ def is_market_open():
 
 def fetch_candles(pair):
     url = f"https://api-fxpractice.oanda.com/v3/instruments/{pair}/candles"
-    params = {
-        "count": 10,
-        "granularity": TIMEFRAME,
-        "price": "M"
-    }
-    headers = {
-        "Authorization": f"Bearer {OANDA_API_KEY}"
-    }
+    params = {"count": 15, "granularity": TIMEFRAME, "price": "M"}
+    headers = {"Authorization": f"Bearer {OANDA_API_KEY}"}
     response = requests.get(url, headers=headers, params=params)
     if response.status_code != 200:
-        print(f"❌ Failed to fetch candles for {pair}: {response.status_code}")
+        print(f"❌ Error fetching {pair}: {response.status_code}")
         return []
     return response.json().get("candles", [])
 
-def detect_liquidity_sweep_rejection(candles):
-    if len(candles) < 4:
+def detect_ob_with_liquidity_sweep(candles):
+    if len(candles) < 10:
         return None
 
-    c1 = candles[-4]
-    c2 = candles[-3]
-    c3 = candles[-2]
-    c4 = candles[-1]
+    highs = [float(c["mid"]["h"]) for c in candles[-10:]]
+    lows = [float(c["mid"]["l"]) for c in candles[-10:]]
 
-    def to_float(c): return float(c["mid"]["c"]), float(c["mid"]["o"]), float(c["mid"]["h"]), float(c["mid"]["l"])
-    c3_close, c3_open, c3_high, c3_low = to_float(c3)
-    c4_close, c4_open, c4_high, c4_low = to_float(c4)
+    recent = candles[-1]
+    prev = candles[-2]
+    recent_high = float(recent["mid"]["h"])
+    recent_low = float(recent["mid"]["l"])
+    recent_close = float(recent["mid"]["c"])
+    prev_high = float(prev["mid"]["h"])
+    prev_low = float(prev["mid"]["l"])
 
-    # Sweep: candle 3 sweeps high or low, then rejection from candle 4
-    if c3_high > max(float(c["mid"]["h"]) for c in candles[-6:-3]) and c4_close < c4_open:
-        return {"type": "Bearish OB", "entry": c4_open, "exit": c4_close}
-    elif c3_low < min(float(c["mid"]["l"]) for c in candles[-6:-3]) and c4_close > c4_open:
-        return {"type": "Bullish OB", "entry": c4_open, "exit": c4_close}
+    max_high = max(highs[:-2])
+    min_low = min(lows[:-2])
+
+    # Bullish OB: sweep low + close higher
+    if recent_low < min_low and recent_close > prev_high:
+        return {
+            "type": "Bullish OB",
+            "entry": recent_close,
+            "exit": recent_close + 0.0020,  # Example TP
+            "sl": recent_low - 0.0010
+        }
+    # Bearish OB: sweep high + close lower
+    elif recent_high > max_high and recent_close < prev_low:
+        return {
+            "type": "Bearish OB",
+            "entry": recent_close,
+            "exit": recent_close - 0.0020,  # Example TP
+            "sl": recent_high + 0.0010
+        }
     return None
 
-def send_discord_alert(pair, ob_type, entry, exit):
+def send_discord_alert(pair, ob):
     now = datetime.datetime.utcnow() + datetime.timedelta(hours=TIMEZONE_OFFSET)
-    chart_symbol = pair.replace("_", "")
-    chart_link = f"https://www.tradingview.com/chart/?symbol=FX:{chart_symbol}"
+    chart_link = f"https://www.tradingview.com/chart/?symbol=OANDA:{pair.replace('_', '')}"
     embed = {
-        "title": f"{ob_type} Detected on {pair}",
-        "description": f"📍 **Entry**: `{entry}`\n🎯 **Exit**: `{exit}`\n\n[📈 View on TradingView]({chart_link})",
-        "color": 65280 if "Bullish" in ob_type else 16711680,
+        "title": f"{ob['type']} Detected on {pair}",
+        "description": f"📍 **Entry**: `{ob['entry']}`\n🎯 **TP**: `{ob['exit']}`\n🛑 **SL**: `{ob['sl']}`\n\n[📈 View on TradingView]({chart_link})",
+        "color": 65280 if "Bullish" in ob["type"] else 16711680,
         "timestamp": now.isoformat()
     }
     data = {"embeds": [embed]}
     res = requests.post(DISCORD_WEBHOOK_URL, json=data)
-    print("✅ Alert sent" if res.status_code == 204 else f"❌ Alert failed: {res.status_code} - {res.text}")
+    print("✅ Alert sent" if res.status_code == 204 else f"❌ Failed: {res.text}")
 
 def scan_market():
     while True:
         if not is_market_open():
-            print("📴 Market is closed. Skipping scan.")
+            print("📴 Market is closed.")
             time.sleep(300)
             continue
 
-        print("🔄 Scanning H4 chart...")
+        print("🔎 Scanning...")
         for pair in PAIRS:
             candles = fetch_candles(pair)
-            if not candles:
-                continue
-            ob = detect_liquidity_sweep_rejection(candles)
+            ob = detect_ob_with_liquidity_sweep(candles)
             if ob:
-                send_discord_alert(pair, ob["type"], ob["entry"], ob["exit"])
+                last = last_alerts.get(pair)
+                if last != ob["entry"]:
+                    send_discord_alert(pair, ob)
+                    last_alerts[pair] = ob["entry"]
             else:
-                print(f"No valid setup on {pair}")
-        print("⏳ Sleeping 5 mins...\n")
+                print(f"No OB on {pair}")
         time.sleep(300)
 
 @app.route('/')
 def home():
-    return jsonify({"status": "Session OB Bot is running"})
+    return jsonify({"status": "Session OB Bot running"})
 
 def run_flask():
     app.run(host="0.0.0.0", port=10000)
