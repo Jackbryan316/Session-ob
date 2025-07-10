@@ -1,4 +1,5 @@
-# Updated Session OB Bot with Liquidity Sweep + Rejection Confirmation
+
+# Session OB Bot with Dynamic RR (1:2) and Liquidity Sweep + Rejection
 
 import os
 import time
@@ -15,8 +16,7 @@ PAIRS = ["XAU_USD", "GBP_USD", "EUR_USD"]
 TIMEFRAME = "H4"
 
 app = Flask(__name__)
-
-last_alerts = {}  # Store last signal per pair
+last_alerts = {}
 
 def is_market_open():
     now = datetime.datetime.utcnow()
@@ -49,23 +49,32 @@ def detect_ob_with_liquidity_sweep(candles):
 
     max_high = max(highs[:-2])
     min_low = min(lows[:-2])
+    rr_ratio = 2  # Risk:Reward = 1:2
 
-    # Bullish OB: sweep low + close higher
+    # Bullish OB
     if recent_low < min_low and recent_close > prev_high:
+        sl = recent_low
+        sl_distance = recent_close - sl
+        tp = recent_close + (sl_distance * rr_ratio)
         return {
             "type": "Bullish OB",
-            "entry": recent_close,
-            "exit": recent_close + 0.0020,  # Example TP
-            "sl": recent_low - 0.0010
+            "entry": round(recent_close, 5),
+            "exit": round(tp, 5),
+            "sl": round(sl, 5)
         }
-    # Bearish OB: sweep high + close lower
+
+    # Bearish OB
     elif recent_high > max_high and recent_close < prev_low:
+        sl = recent_high
+        sl_distance = sl - recent_close
+        tp = recent_close - (sl_distance * rr_ratio)
         return {
             "type": "Bearish OB",
-            "entry": recent_close,
-            "exit": recent_close - 0.0020,  # Example TP
-            "sl": recent_high + 0.0010
+            "entry": round(recent_close, 5),
+            "exit": round(tp, 5),
+            "sl": round(sl, 5)
         }
+
     return None
 
 def send_discord_alert(pair, ob):
@@ -73,7 +82,12 @@ def send_discord_alert(pair, ob):
     chart_link = f"https://www.tradingview.com/chart/?symbol=OANDA:{pair.replace('_', '')}"
     embed = {
         "title": f"{ob['type']} Detected on {pair}",
-        "description": f"📍 **Entry**: `{ob['entry']}`\n🎯 **TP**: `{ob['exit']}`\n🛑 **SL**: `{ob['sl']}`\n\n[📈 View on TradingView]({chart_link})",
+        "description": (
+            f"📍 **Entry**: `{ob['entry']}`\n"
+            f"🎯 **TP**: `{ob['exit']}`\n"
+            f"🛑 **SL**: `{ob['sl']}`\n\n"
+            f"[📈 View on TradingView]({chart_link})"
+        ),
         "color": 65280 if "Bullish" in ob["type"] else 16711680,
         "timestamp": now.isoformat()
     }
@@ -97,6 +111,8 @@ def scan_market():
                 if last != ob["entry"]:
                     send_discord_alert(pair, ob)
                     last_alerts[pair] = ob["entry"]
+                else:
+                    print(f"⚠️ Duplicate alert skipped for {pair}")
             else:
                 print(f"No OB on {pair}")
         time.sleep(300)
@@ -111,7 +127,6 @@ def run_flask():
 if __name__ == '__main__':
     Thread(target=run_flask).start()
     scan_market()
-
 
 
 
